@@ -64,10 +64,13 @@ def qk_norm_rope_kernel(PROJ, QN, KN, INVF, QOUT, KVC, T, pos0,
 
 def qk_norm_rope(proj, qn, kn, invf, qout, kvc, pos0, eps=1e-6):
     T = proj.shape[0]
-    NQ, NKV, HD = 8, 2, 256
+    HD = qn.numel()
+    NQ = qout.shape[1] // HD
+    NKV = kvc.shape[1] // (2 * HD)
+    RD = 2 * invf.numel()
     qk_norm_rope_kernel[(T, NQ + 2 * NKV)](
         proj, qn, kn, invf, qout, kvc, T, pos0,
-        NQ=NQ, NKV=NKV, HD=HD, RD=64, eps=eps, stride_pm=proj.stride(0), num_warps=4,
+        NQ=NQ, NKV=NKV, HD=HD, RD=RD, eps=eps, stride_pm=proj.stride(0), num_warps=4,
     )
 
 
@@ -113,10 +116,10 @@ def attn_prefill_kernel(Q, KVC, OUT, T, pos0, NQ: tl.constexpr, NKV: tl.constexp
              out.to(tl.bfloat16), mask=(offs_m < T)[:, None])
 
 
-def attn_prefill(q, kvc, out, T, pos0=0, block_m=32, block_n=32):
-    NQ, NKV, HD = 8, 2, 256
-    grid = (triton.cdiv(T, block_m) * NQ,)
-    attn_prefill_kernel[grid](q, kvc, out, T, pos0, NQ=NQ, NKV=NKV, HD=HD,
+def attn_prefill(q, kvc, out, T, pos0=0, block_m=32, block_n=32,
+                 nq=8, nkv=2, hd=256):
+    grid = (triton.cdiv(T, block_m) * nq,)
+    attn_prefill_kernel[grid](q, kvc, out, T, pos0, NQ=nq, NKV=nkv, HD=hd,
                               BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4, num_stages=2)
     return out
 
@@ -152,8 +155,7 @@ def attn_decode_kernel(Q, KVC, OUT, pos, NQ: tl.constexpr, NKV: tl.constexpr,
     tl.store(OUT + head * HD + offs_d, (acc / l_i).to(tl.bfloat16))
 
 
-def attn_decode(q, kvc, out, pos, block_n=32):
-    NQ, NKV, HD = 8, 2, 256
-    attn_decode_kernel[(NQ,)](q, kvc, out, pos, NQ=NQ, NKV=NKV, HD=HD,
+def attn_decode(q, kvc, out, pos, block_n=32, nq=8, nkv=2, hd=256):
+    attn_decode_kernel[(nq,)](q, kvc, out, pos, NQ=nq, NKV=nkv, HD=hd,
                               BLOCK_N=block_n, num_warps=4)
     return out

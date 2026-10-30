@@ -1,5 +1,5 @@
 """ComfyUI node: expand a short idea into a detailed prompt with a local
-Qwen3.5-0.8B model running on a fused INT8 Triton kernel engine."""
+Qwen3.5 model running on a fused INT8 Triton kernel engine."""
 import os
 import threading
 
@@ -27,6 +27,10 @@ try:  # prefer ComfyUI's own resolution when available
 except Exception:
     pass
 
+# Additional folders scanned for Qwen3.5 checkpoints, on top of models/LLM.
+# Override or extend with QWEN35_MODEL_PATHS (os.pathsep separated).
+EXTRA_MODEL_ROOTS = [r"D:\models"]
+
 MAX_TOKEN_CHOICES = ["512", "1024", "2048", "4096"]
 
 _cache = {}
@@ -34,16 +38,32 @@ _tok_cache = {}
 _lock = threading.Lock()
 
 
+def _model_roots():
+    roots = [LLM_ROOT]
+    for p in os.environ.get("QWEN35_MODEL_PATHS", "").split(os.pathsep):
+        p = p.strip().strip('"')
+        if p:
+            roots.append(p)
+    roots.extend(EXTRA_MODEL_ROOTS)
+    return roots
+
+
+def _model_map():
+    """label -> checkpoint directory, for every discoverable model."""
+    return dict(discover_models(_model_roots()))
+
+
 def _model_dirs():
-    names = discover_models(LLM_ROOT)
-    return names
+    return list(_model_map())
 
 
 def _resolve_model(name):
-    d = os.path.join(LLM_ROOT, name)
-    if not os.path.isdir(d):
-        raise FileNotFoundError(f"model folder not found: {d}")
-    return d
+    path = _model_map().get(name)
+    if path is None:
+        if os.path.isdir(name):
+            return name
+        raise FileNotFoundError(f"model not found: {name}")
+    return path
 
 
 def _get_engine(model_dir):
@@ -60,7 +80,16 @@ def _get_engine(model_dir):
                 del _cache[key]
         if mm is not None:
             mm.free_memory(2_000_000_000, torch.device("cuda"))
-        eng = Engine(model_dir, device="cuda", log=_log)
+        try:
+            eng = Engine(model_dir, device="cuda", log=_log)
+        except torch.cuda.OutOfMemoryError:
+            # A bigger checkpoint (e.g. a 2B model) may need ComfyUI to evict more.
+            if mm is None:
+                raise
+            _log("[qwen35] out of VRAM, freeing ComfyUI models and retrying")
+            mm.free_memory(3_600_000_000, torch.device("cuda"))
+            torch.cuda.empty_cache()
+            eng = Engine(model_dir, device="cuda", log=_log)
         _cache[model_dir] = eng
         return eng
 
@@ -114,13 +143,13 @@ class Qwen35PromptEnhancer:
             },
             "optional": {
                 "temperature": ("FLOAT", {
-                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "default": 0.85, "min": 0.0, "max": 2.0, "step": 0.01,
                 }),
                 "top_p": ("FLOAT", {
                     "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
                 }),
                 "top_k": ("INT", {
-                    "default": 40, "min": 0, "max": 200, "step": 1,
+                    "default": 20, "min": 0, "max": 200, "step": 1,
                 }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xFFFFFFFF, "step": 1,

@@ -1,20 +1,28 @@
-"""W8A16 checkpoint loading -> stacked INT8 tensors ready for the Triton kernels."""
+"""Checkpoint loading -> stacked tensors ready for the Triton kernels.
+
+Two quantisation formats are supported:
+
+* **W8A16** — `<proj>.qweight` int8 `[in, out]` + `<proj>.scale` bf16 `[out]`.
+  Weights stay int8 and are used directly by the GEMM.
+* **W4A16 groupwise** — `<proj>.packed_weight` uint8 `[out, in//2]` (even-K in the
+  low nibble, odd-K in the high nibble) + `<proj>.scale` bf16 `[out, in//group]`.
+  Weights stay packed at 4 bits and are expanded to int8 inside the dot loop, so
+  a 2B model keeps 685 MB of weights instead of 1.37 GB.
+"""
 import glob
 import json
 import os
-import re
 
 import torch
 from safetensors import safe_open
-
-from .kernels.common import next_pow2
 
 
 class QwenWeights:
     """All quantised weights stacked per role (layer index on dim 0)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, quant="w8"):
         self.cfg = cfg
+        self.quant = quant
         self.t = {}          # name -> tensor
         self.device = torch.device("cpu")
         self._cpu_backup = None
@@ -64,21 +72,31 @@ def _is_qwen35_dir(d):
     return "hidden_size" in sub and "layer_types" in sub
 
 
-def discover_models(llm_root):
-    """Directories under models/LLM that look like a quantised Qwen3.5 checkpoint."""
-    out = []
-    if not os.path.isdir(llm_root):
-        return out
-    for name in sorted(os.listdir(llm_root)):
-        d = os.path.join(llm_root, name)
-        if not os.path.isdir(d) or name.startswith("."):
+def discover_models(roots):
+    """Quantised Qwen3.5 checkpoints under `roots` -> [(label, path), ...].
+
+    Labels are the folder name, disambiguated by the parent folder name when two
+    roots contain the same name.
+    """
+    if isinstance(roots, str):
+        roots = [roots]
+    out, seen = [], {}
+    for root in roots:
+        if not root or not os.path.isdir(root):
             continue
-        if not _is_qwen35_dir(d):
-            continue
-        sf = [p for p in glob.glob(os.path.join(d, "*.safetensors"))]
-        if not sf:
-            continue
-        out.append(name)
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d) or name.startswith("."):
+                continue
+            if not _is_qwen35_dir(d):
+                continue
+            if not glob.glob(os.path.join(d, "*.safetensors")):
+                continue
+            label = name
+            if label in seen:
+                label = f"{os.path.basename(os.path.normpath(root))}/{name}"
+            seen[label] = d
+            out.append((label, d))
     return out
 
 
@@ -86,11 +104,26 @@ def _pick_ckpt(d):
     files = sorted(glob.glob(os.path.join(d, "*.safetensors")))
     if not files:
         raise FileNotFoundError(f"no .safetensors in {d}")
-    base = os.path.basename(d).lower()
+    base = os.path.basename(os.path.normpath(d)).lower()
     for f in files:
         if base and base in os.path.basename(f).lower():
             return f
     return files[0]
+
+
+def _quant_config(model_dir, keys):
+    """Return (kind, group_size) for the checkpoint's linear-layer format."""
+    qcfg = {}
+    p = os.path.join(model_dir, "quantization_config.json")
+    if os.path.isfile(p):
+        try:
+            qcfg = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            qcfg = {}
+    packed = any(k.endswith(".packed_weight") for k in keys)
+    if packed:
+        return "w4", int(qcfg.get("group_size", 128))
+    return "w8", 0
 
 
 def load_weights(model_dir, device="cuda", log=print):
@@ -113,75 +146,74 @@ def load_weights(model_dir, device="cuda", log=print):
     NKV = cfg["num_key_value_heads"]
     HD = cfg["head_dim"]
     conv_dim = 2 * KD + VD
-
-    dev = torch.device(device)
-    w = QwenWeights(cfg)
-    t = w.t
-
-    t["embed"] = _stacked((V, H), torch.bfloat16, dev)
-    t["final_norm"] = _stacked((H,), torch.bfloat16, dev)
-    t["in_norm"] = _stacked((NL, H), torch.bfloat16, dev)
-    t["post_norm"] = _stacked((NL, H), torch.bfloat16, dev)
-
-    t["lin_qkv"] = _stacked((n_lin, H, conv_dim), torch.int8, dev)
-    t["lin_qkv_s"] = _stacked((n_lin, conv_dim), torch.float32, dev)
-    t["lin_z"] = _stacked((n_lin, H, VD), torch.int8, dev)
-    t["lin_z_s"] = _stacked((n_lin, VD), torch.float32, dev)
-    t["lin_b"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
-    t["lin_a"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
-    t["lin_conv"] = _stacked((n_lin, conv_dim, cfg["linear_conv_kernel_dim"]), torch.bfloat16, dev)
-    t["lin_dt"] = _stacked((n_lin, NH), torch.bfloat16, dev)
-    t["lin_alog"] = _stacked((n_lin, NH), torch.bfloat16, dev)
-    t["lin_norm_w"] = _stacked((n_lin, DV), torch.bfloat16, dev)
-    t["lin_out"] = _stacked((n_lin, VD, H), torch.int8, dev)
-    t["lin_out_s"] = _stacked((n_lin, H), torch.float32, dev)
-
-    t["attn_q"] = _stacked((n_full, H, NQ * HD * 2), torch.int8, dev)
-    t["attn_q_s"] = _stacked((n_full, NQ * HD * 2), torch.float32, dev)
-    t["attn_k"] = _stacked((n_full, H, NKV * HD), torch.int8, dev)
-    t["attn_k_s"] = _stacked((n_full, NKV * HD), torch.float32, dev)
-    t["attn_v"] = _stacked((n_full, H, NKV * HD), torch.int8, dev)
-    t["attn_v_s"] = _stacked((n_full, NKV * HD), torch.float32, dev)
-    t["attn_o"] = _stacked((n_full, NQ * HD, H), torch.int8, dev)
-    t["attn_o_s"] = _stacked((n_full, H), torch.float32, dev)
-    t["attn_qn"] = _stacked((n_full, HD), torch.bfloat16, dev)
-    t["attn_kn"] = _stacked((n_full, HD), torch.bfloat16, dev)
-
-    t["mlp_gate"] = _stacked((NL, H, I), torch.int8, dev)
-    t["mlp_gate_s"] = _stacked((NL, I), torch.float32, dev)
-    t["mlp_up"] = _stacked((NL, H, I), torch.int8, dev)
-    t["mlp_up_s"] = _stacked((NL, I), torch.float32, dev)
-    t["mlp_down"] = _stacked((NL, I, H), torch.int8, dev)
-    t["mlp_down_s"] = _stacked((NL, H), torch.float32, dev)
-
     ckpt = _pick_ckpt(model_dir)
     log(f"[qwen35] loading {ckpt}")
 
     with safe_open(ckpt, framework="pt") as f:
         keys = set(f.keys())
+        kind, wgroup = _quant_config(model_dir, keys)
+        dev = torch.device(device)
+        w = QwenWeights(cfg, quant=kind)
+        t = w.t
+
+        # ---- quantised linear layers: (role, out_dim, in_dim, n_layers) ------
+        roles = [
+            ("lin_qkv", conv_dim, H, n_lin),
+            ("lin_z", VD, H, n_lin),
+            ("lin_out", H, VD, n_lin),
+            ("attn_q", NQ * HD * 2, H, n_full),
+            ("attn_k", NKV * HD, H, n_full),
+            ("attn_v", NKV * HD, H, n_full),
+            ("attn_o", H, NQ * HD, n_full),
+            ("mlp_gate", I, H, NL),
+            ("mlp_up", I, H, NL),
+            ("mlp_down", H, I, NL),
+        ]
+        if kind == "w4":
+            for role, nout, nin, n in roles:
+                assert nin % wgroup == 0 and nin % 2 == 0, (role, nin, wgroup)
+                # K-major: [K//2, N] nibbles and [K//WG, N] scales, so the GEMM
+                # reads each tile as one coalesced run along N.
+                t[role] = _stacked((n, nin // 2, nout), torch.uint8, dev)
+                t[role + "_s"] = _stacked((n, nin // wgroup, nout), torch.bfloat16, dev)
+        else:
+            for role, nout, nin, n in roles:
+                t[role] = _stacked((n, nin, nout), torch.int8, dev)
+                t[role + "_s"] = _stacked((n, nout), torch.float32, dev)
+
+        t["embed"] = _stacked((V, H), torch.bfloat16, dev)
+        t["final_norm"] = _stacked((H,), torch.bfloat16, dev)
+        t["in_norm"] = _stacked((NL, H), torch.bfloat16, dev)
+        t["post_norm"] = _stacked((NL, H), torch.bfloat16, dev)
+        t["lin_b"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
+        t["lin_a"] = _stacked((n_lin, NH, H), torch.bfloat16, dev)
+        t["lin_conv"] = _stacked((n_lin, conv_dim, cfg["linear_conv_kernel_dim"]),
+                                 torch.bfloat16, dev)
+        t["lin_dt"] = _stacked((n_lin, NH), torch.bfloat16, dev)
+        t["lin_alog"] = _stacked((n_lin, NH), torch.bfloat16, dev)
+        t["lin_norm_w"] = _stacked((n_lin, DV), torch.bfloat16, dev)
+        t["attn_qn"] = _stacked((n_full, HD), torch.bfloat16, dev)
+        t["attn_kn"] = _stacked((n_full, HD), torch.bfloat16, dev)
 
         def get(name):
             return f.get_tensor(name)
 
-        def q(name, dst, row=None):
-            qw = get(name + ".qweight")
-            sc = get(name + ".scale").to(torch.float32)
-            if row is None:
-                dst.copy_(qw.to(dev))
-                return sc.to(dev)
-            dst.copy_(qw.to(dev))
-            return sc.to(dev)
+        def put(role, slot, name):
+            """Copy one quantised projection into its stacked destination."""
+            if kind == "w4":
+                t[role][slot].copy_(get(name + ".packed_weight").t().contiguous().to(dev))
+                t[role + "_s"][slot].copy_(get(name + ".scale").t().contiguous().to(dev))
+            else:
+                t[role][slot].copy_(get(name + ".qweight").to(dev))
+                t[role + "_s"][slot].copy_(get(name + ".scale").float().to(dev))
 
         lin_i = full_i = 0
         for i in range(NL):
             if layer_types[i] == "linear_attention":
                 p = f"model.layers.{i}.linear_attn."
-                q(p + "in_proj_qkv", t["lin_qkv"][lin_i])
-                t["lin_qkv_s"][lin_i].copy_(get(p + "in_proj_qkv.scale").float().to(dev))
-                q(p + "in_proj_z", t["lin_z"][lin_i])
-                t["lin_z_s"][lin_i].copy_(get(p + "in_proj_z.scale").float().to(dev))
-                q(p + "out_proj", t["lin_out"][lin_i])
-                t["lin_out_s"][lin_i].copy_(get(p + "out_proj.scale").float().to(dev))
+                put("lin_qkv", lin_i, p + "in_proj_qkv")
+                put("lin_z", lin_i, p + "in_proj_z")
+                put("lin_out", lin_i, p + "out_proj")
                 t["lin_b"][lin_i].copy_(get(p + "in_proj_b.weight").to(dev))
                 t["lin_a"][lin_i].copy_(get(p + "in_proj_a.weight").to(dev))
                 t["lin_conv"][lin_i].copy_(get(p + "conv1d.weight").squeeze(1).to(dev))
@@ -191,25 +223,18 @@ def load_weights(model_dir, device="cuda", log=print):
                 lin_i += 1
             else:
                 p = f"model.layers.{i}.self_attn."
-                q(p + "q_proj", t["attn_q"][full_i])
-                t["attn_q_s"][full_i].copy_(get(p + "q_proj.scale").float().to(dev))
-                q(p + "k_proj", t["attn_k"][full_i])
-                t["attn_k_s"][full_i].copy_(get(p + "k_proj.scale").float().to(dev))
-                q(p + "v_proj", t["attn_v"][full_i])
-                t["attn_v_s"][full_i].copy_(get(p + "v_proj.scale").float().to(dev))
-                q(p + "o_proj", t["attn_o"][full_i])
-                t["attn_o_s"][full_i].copy_(get(p + "o_proj.scale").float().to(dev))
+                put("attn_q", full_i, p + "q_proj")
+                put("attn_k", full_i, p + "k_proj")
+                put("attn_v", full_i, p + "v_proj")
+                put("attn_o", full_i, p + "o_proj")
                 t["attn_qn"][full_i].copy_(get(p + "q_norm.weight").to(dev))
                 t["attn_kn"][full_i].copy_(get(p + "k_norm.weight").to(dev))
                 full_i += 1
 
             p = f"model.layers.{i}."
-            q(p + "mlp.gate_proj", t["mlp_gate"][i])
-            t["mlp_gate_s"][i].copy_(get(p + "mlp.gate_proj.scale").float().to(dev))
-            q(p + "mlp.up_proj", t["mlp_up"][i])
-            t["mlp_up_s"][i].copy_(get(p + "mlp.up_proj.scale").float().to(dev))
-            q(p + "mlp.down_proj", t["mlp_down"][i])
-            t["mlp_down_s"][i].copy_(get(p + "mlp.down_proj.scale").float().to(dev))
+            put("mlp_gate", i, p + "mlp.gate_proj")
+            put("mlp_up", i, p + "mlp.up_proj")
+            put("mlp_down", i, p + "mlp.down_proj")
             t["in_norm"][i].copy_(get(p + "input_layernorm.weight").to(dev))
             t["post_norm"][i].copy_(get(p + "post_attention_layernorm.weight").to(dev))
 
@@ -233,5 +258,5 @@ def load_weights(model_dir, device="cuda", log=print):
         t["lm_head"] = head_q
         t["lm_head_s"] = head_s
 
-    log(f"[qwen35] weights loaded: {w.nbytes()/1e9:.2f} GB on {device}")
+    log(f"[qwen35] weights loaded: {w.nbytes()/1e9:.2f} GB ({kind.upper()}) on {device}")
     return w

@@ -1,4 +1,8 @@
-"""Qwen3.5-0.8B INT8 inference engine (prefill + decode) driving the Triton kernels."""
+"""Qwen3.5 INT8 inference engine (prefill + decode) driving the Triton kernels.
+
+The same engine runs both supported checkpoint formats: W8A16 (int8 weights) and
+W4A16 groupwise (int4 weights kept packed, expanded inside the dot loop).  Every
+shape comes from `config.json`, so a 0.8B and a 2B model use identical code."""
 import math
 import os
 import time
@@ -101,7 +105,9 @@ class Engine:
         self.HD = cfg["head_dim"]
         self.eps = cfg.get("rms_norm_eps", 1e-6)
         self.V = cfg["vocab_size"]
-        self.invf = rope_inv_freq(cfg["rope_parameters"]["rope_theta"], 64, self.device)
+        rope = cfg.get("rope_parameters", {})
+        self.RD = int(self.HD * rope.get("partial_rotary_factor", 0.25))
+        self.invf = rope_inv_freq(rope.get("rope_theta", 1e7), self.RD, self.device)
 
         self.kv = torch.zeros((self.NL, max_seq, 2 * self.NKV * self.HD),
                               dtype=torch.bfloat16, device=self.device)
@@ -188,10 +194,12 @@ class Engine:
         qk_norm_rope(ws.proj, w["attn_qn"][fi], w["attn_kn"][fi], self.invf,
                      ws.q, self.kv[i], pos0, self.eps)
         if T == 1:
-            attn_decode(ws.q[0], self.kv[i], ws.aout[0], pos0)
+            attn_decode(ws.q[0], self.kv[i], ws.aout[0], pos0,
+                        nq=self.NQ, nkv=self.NKV, hd=self.HD)
         else:
-            attn_prefill(ws.q, self.kv[i], ws.aout, T, pos0)
-        gate_mul_quant(ws.aout, ws.proj, ws.aq_o, ws.as_o)
+            attn_prefill(ws.q, self.kv[i], ws.aout, T, pos0,
+                         nq=self.NQ, nkv=self.NKV, hd=self.HD)
+        gate_mul_quant(ws.aout, ws.proj, ws.aq_o, ws.as_o, hd=self.HD)
         gemm_i8(ws.aq_o, ws.as_o, w["attn_o"][fi], w["attn_o_s"][fi],
                 ws.hidden, residual=ws.hidden)
 

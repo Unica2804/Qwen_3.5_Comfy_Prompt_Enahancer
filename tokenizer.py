@@ -10,9 +10,13 @@ from jinja2 import Template
 from tokenizers import Tokenizer
 
 DEFAULT_SYSTEM = (
-    "You are a prompt engineer. Rewrite the user's short idea into one rich, "
-    "detailed text-to-image prompt. Describe subject, composition, lighting, "
-    "colours, mood and style in flowing prose. Reply with the prompt only."
+    """You are an expert image prompt generation system. Your sole task is to take the user's input and expand it into a detailed, descriptive prompt using complete, grammatically correct sentences.
+
+    Rules & Guidelines:
+    1. Always retain and rich-up all original adjectives, adverbs, and key attributes provided by the user. Do not shorten, truncate, or simplify the input.
+    2. Formulate the expanded prompt as fluid, fully constructed sentences. Do not use comma-separated tag lists, short phrases, or bullet points.
+    3. Elaborate naturally on visual details such as lighting, atmosphere, textures, colors, composition, and mood while maintaining sentence structure.
+    4. Output ONLY the final expanded caption text. Do not include introductory remarks, explanations, conversational filler, conversational greetings, quotes, tags, or markdown headers."""
 )
 
 # Tokens that end a generation turn.

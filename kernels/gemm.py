@@ -8,18 +8,13 @@ import torch
 import triton
 import triton.language as tl
 
-from .common import GROUP, GROUP_C, round_i8, silu
+from .common import GROUP, GROUP_C, round_i8, silu, swizzle
+from .w4 import gemm_w4, mlp_gate_up_quant_w4, proj3_w4
 
 
-@triton.jit
-def _swizzle(pid, num_pid_m, num_pid_n, GROUP_M: tl.constexpr):
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
+def _is_w4(b):
+    """W4 checkpoints store uint8 packed nibbles; W8A16 stores int8 + 1-D scales."""
+    return b.dtype == torch.uint8
 
 
 @triton.jit
@@ -30,7 +25,7 @@ def gemm_i8_kernel(A, AS, B, BS, C, M, N, K, NG,
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_m, pid_n = _swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
+    pid_m, pid_n = swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -64,9 +59,16 @@ def gemm_i8_kernel(A, AS, B, BS, C, M, N, K, NG,
 
 def gemm_i8(a_q, a_s, b, b_s, out, residual=None, block_m=None, block_n=None, block_k=64,
             group_m=8):
-    """out[M,N] (bf16) = (a_q * a_s) @ (b * b_s), b is [K,N] int8, optional residual add.
+    """out[M,N] (bf16) = (a_q * a_s) @ (b * b_s), optional residual add.
+
+    `b` is int8 [K,N] with one scale per output row (W8A16 checkpoints), or uint8
+    [N,K//2] packed int4 with per-group scales (W4A16 checkpoints), in which case
+    the nibbles are expanded to int8 inside the dot loop.
 
     a_s holds one scale per GROUP of K (shape [M, K//GROUP])."""
+    if _is_w4(b):
+        return gemm_w4(a_q, a_s, b, b_s, out, residual=residual, block_m=block_m,
+                       block_n=block_n, block_k=block_k, group_m=group_m)
     M, K = a_q.shape
     N = b.shape[1]
     if block_m is None:
@@ -97,7 +99,7 @@ def mlp_gate_up_kernel(A, AS, BG, BSG, BU, BSU, C, M, N, K, NG,
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_m, pid_n = _swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
+    pid_m, pid_n = swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -160,7 +162,7 @@ def mlp_gate_up_quant_kernel(A, AS, BG, BSG, BU, BSU, Q, QS, M, N, K, NG,
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    pid_m, pid_n = _swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
+    pid_m, pid_n = swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -210,6 +212,9 @@ def mlp_gate_up_quant_kernel(A, AS, BG, BSG, BU, BSU, Q, QS, M, N, K, NG,
 
 def mlp_gate_up_quant(a_q, a_s, wg, wsg, wu, wsu, out_q, out_s, block_k=64):
     """Fused gate/up MLP + int8 quantisation of the activation (the down_proj input)."""
+    if _is_w4(wg):
+        return mlp_gate_up_quant_w4(a_q, a_s, wg, wsg, wu, wsu, out_q, out_s,
+                                    block_k=block_k)
     M, K = a_q.shape
     N = wg.shape[1]
     block_m = 16 if M <= 16 else (32 if M <= 64 else 64)
@@ -234,7 +239,7 @@ def proj3_kernel(A, AS, B1, S1, B2, S2, B3, S3, C, M, N1, N2, N3, K, NG, stride_
     NT = N1 + N2 + N3
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(NT, BLOCK_N)
-    pid_m, pid_n = _swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
+    pid_m, pid_n = swizzle(pid, num_pid_m, num_pid_n, GROUP_M)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -281,6 +286,8 @@ def proj3_kernel(A, AS, B1, S1, B2, S2, B3, S3, C, M, N1, N2, N3, K, NG, stride_
 
 
 def proj3(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=64):
+    if _is_w4(w1):
+        return proj3_w4(a_q, a_s, w1, s1, w2, s2, w3, s3, out, block_k=block_k)
     M, K = a_q.shape
     n1 = w1.shape[1] if w1 is not None else 0
     n2 = w2.shape[1] if w2 is not None else 0

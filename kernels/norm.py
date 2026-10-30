@@ -179,9 +179,9 @@ def gate_mul_quant_kernel(A, G, Q, S, M, N, NG_REAL, HD: tl.constexpr,
     _quant_groups(y, Q, S, row, N, offs, mask, BLOCK, NG, NG_REAL)
 
 
-def gate_mul_quant(a, g, q, s):
+def gate_mul_quant(a, g, q, s, hd=256):
     M, N = a.shape
-    HD = 256
+    HD = hd
     BLOCK = max(256, triton.next_power_of_2(N))
     gate_mul_quant_kernel[(M,)](a, g, q, s, M, N, _ng(N), HD, BLOCK=BLOCK,
                                 NG=BLOCK // GROUP, stride_g=g.stride(0), num_warps=8)
